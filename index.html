@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#2F6F6A">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="build" content="9b304e5fef">
+<meta name="build" content="05c75e2ec7">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
@@ -466,26 +466,8 @@ function xlsxBlob(sheets) {
   sheets.forEach((s, i) => files.push(f(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s))));
   return new Blob(zipStore(files), { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
 }
-async function readXlsx(buf) {
-  const z = await unzipRead(buf); const dec = new TextDecoder();
-  const txt = async (n) => (z[n] ? dec.decode(await z[n]()) : null);
-  const parse = (s) => new DOMParser().parseFromString(s, 'application/xml');
-  const ss = []; const sst = await txt('xl/sharedStrings.xml');
-  if (sst) for (const si of parse(sst).getElementsByTagName('si')) {
-    let t = ''; for (const n of si.childNodes) { if (n.nodeName === 't') t += n.textContent; else if (n.nodeName === 'r') for (const x of n.childNodes) if (x.nodeName === 't') t += x.textContent; }
-    ss.push(t);
-  }
-  let target = null;
-  const wb = await txt('xl/workbook.xml'), rels = await txt('xl/_rels/workbook.xml.rels');
-  if (wb && rels) {
-    const sh = parse(wb).getElementsByTagName('sheet')[0];
-    const rid = sh && (sh.getAttribute('r:id') || sh.getAttributeNS(XRNS, 'id'));
-    for (const r of parse(rels).getElementsByTagName('Relationship')) if (r.getAttribute('Id') === rid) { target = r.getAttribute('Target'); break; }
-    if (target) target = target.startsWith('/') ? target.slice(1) : 'xl/' + target;
-  }
-  if (!target || !z[target]) target = Object.keys(z).filter((n) => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort()[0];
-  if (!target) throw new Error('no sheet');
-  const doc = parse(await txt(target)); const rows = [];
+function parseSheetRows(doc, ss) {
+  const rows = [];
   for (const row of doc.getElementsByTagName('row')) {
     const arr = [];
     for (const c of row.getElementsByTagName('c')) {
@@ -499,6 +481,40 @@ async function readXlsx(buf) {
     rows.push(arr);
   }
   return rows.filter((r) => r.some((c) => String(c).trim() !== ''));
+}
+/* بيرجّع كل أوراق الملف: [{name, rows}] */
+async function readXlsxAll(buf) {
+  const z = await unzipRead(buf); const dec = new TextDecoder();
+  const txt = async (n) => (z[n] ? dec.decode(await z[n]()) : null);
+  const parse = (s) => new DOMParser().parseFromString(s, 'application/xml');
+  const ss = []; const sst = await txt('xl/sharedStrings.xml');
+  if (sst) for (const si of parse(sst).getElementsByTagName('si')) {
+    let t = ''; for (const n of si.childNodes) { if (n.nodeName === 't') t += n.textContent; else if (n.nodeName === 'r') for (const x of n.childNodes) if (x.nodeName === 't') t += x.textContent; }
+    ss.push(t);
+  }
+  const wb = await txt('xl/workbook.xml'), rels = await txt('xl/_rels/workbook.xml.rels');
+  const relMap = {}; if (rels) for (const r of parse(rels).getElementsByTagName('Relationship')) relMap[r.getAttribute('Id')] = r.getAttribute('Target');
+  let list = [];
+  if (wb) for (const sh of parse(wb).getElementsByTagName('sheet')) {
+    const rid = sh.getAttribute('r:id') || sh.getAttributeNS(XRNS, 'id'); let tg = relMap[rid];
+    if (tg) tg = tg.startsWith('/') ? tg.slice(1) : 'xl/' + tg;
+    if (tg && z[tg]) list.push({ name: sh.getAttribute('name') || '', target: tg });
+  }
+  if (!list.length) list = Object.keys(z).filter((n) => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort().map((n, i) => ({ name: 'Sheet' + (i + 1), target: n }));
+  if (!list.length) throw new Error('no sheet');
+  const out = [];
+  for (const sh of list) out.push({ name: sh.name, rows: parseSheetRows(parse(await txt(sh.target)), ss) });
+  return out;
+}
+async function readXlsx(buf) { return (await readXlsxAll(buf))[0].rows; }
+/* بيقرأ أي ملف جدول (xlsx / csv / html-xls) ويرجّع أوراقه */
+async function readAnyTable(f) {
+  const buf = await f.arrayBuffer(); const u = new Uint8Array(buf, 0, 4);
+  if (u[0] === 0x50 && u[1] === 0x4B) { if (typeof DecompressionStream === 'undefined') throw new Error('nodecomp'); return readXlsxAll(buf); }
+  if (u[0] === 0xD0 && u[1] === 0xCF) throw new Error('oldxls');
+  let txt = new TextDecoder('utf-8').decode(buf);
+  if (txt.includes('\uFFFD')) { try { txt = new TextDecoder('windows-1256').decode(buf); } catch (e) {} }
+  return [{ name: '', rows: /<table/i.test(txt) ? readHtmlTable(txt) : parseCSV(txt) }];
 }
 
 /* ================= CSV / HTML-table ================= */
@@ -806,9 +822,11 @@ function openOwnersFilter() {
     <div class="two"><button class="btn ghost" data-act="ofReset">مسح الفلاتر</button><button class="btn" data-act="ofApply">تطبيق</button></div>`);
 }
 function vOwners() {
-  const tabs = `<div class="chips"><button class="chip ${OT === 'owners' ? 'on' : ''}" data-act="ot" data-v="owners">أصحاب الحسابات</button>
+  const tabs = `<div class="chips" style="flex-wrap:wrap"><button class="chip ${OT === 'owners' ? 'on' : ''}" data-act="ot" data-v="owners">أصحاب الحسابات</button>
+    <button class="chip ${OT === 'bal' ? 'on' : ''}" data-act="ot" data-v="bal">ملخص الأرصدة</button>
     <button class="chip ${OT === 'parties' ? 'on' : ''}" data-act="ot" data-v="parties">الأطراف الأخرى</button></div>`;
   if (OT === 'parties') return tabs + partiesHtml();
+  if (OT === 'bal') return tabs + balancesView();
   const n = ofCount();
   return `${tabs}<div class="bar"><input id="ownerq" placeholder="ابحث باسم صاحب الحساب أو البنك" value="${esc(OF.q)}">
       <button class="ib ${n ? 'on' : ''}" data-act="ownersFilter">⚙${n ? `<i>${n}</i>` : ''}</button></div>
@@ -838,6 +856,10 @@ function vReports() {
     ${t('🏦', 'كشف حساب لجهة', 'بنك أو محفظة — مقسّم حسب صاحب الحساب', 'repInst')}
     ${t('📋', 'كل الحسابات', 'مع تصدير Excel / PDF', 'repAll')}
     ${t('📅', 'ملخص شهري', 'داخل وخارج كل شهر مع رسم بياني', 'go', 'monthly')}
+    ${t('💰', 'ملخص أرصدة الأصحاب', 'إجمالي رصيد كل صاحب حساب مع اختيار البنك', 'balOpen')}
+    <h3>استيراد</h3>
+    ${t('📊', 'استيراد عمليات من Excel', 'ملف Excel أو CSV فيه عملياتك — بتراجعها قبل التسجيل', 'txImp')}
+    ${db.lastImport ? t('↩', 'تراجع عن آخر استيراد', db.lastImport.ids.length + ' عملية اتضافت', 'imxUndoAsk') : ''}
     <h3>المطابقة مع البنك</h3>
     ${t('📥', 'استيراد كشف البنك ومطابقته', 'Excel أو CSV — تطابق تلقائي وتقرير بالفروقات', 'impStart')}
     <h3>ربط الأجهزة</h3>
@@ -1765,7 +1787,7 @@ async function syncDisconnect() {
 }
 
 /* ---------- الواجهة ---------- */
-function copyText(t) {
+function copyText(t, back = 'closeSheet') {
   const done = () => toast('اتنسخ ✓');
   const legacy = () => {
     const ta = document.createElement('textarea'); ta.value = t; ta.setAttribute('readonly', '');
@@ -1774,10 +1796,10 @@ function copyText(t) {
     let ok = false; try { ok = document.execCommand('copy'); } catch (e) {} ta.remove(); return ok;
   };
   const manual = () => {   // لو الموبايل رفض النسخ التلقائي: نعرض النص محدّد وتنسخه بإيدك
-    sheet(`<div class="sh-h"><b>انسخ النص يدويًا</b><button class="x" data-act="syncOpen">✕</button></div>
+    sheet(`<div class="sh-h"><b>انسخ النص يدويًا</b><button class="x" data-act="${back}">✕</button></div>
       <div class="sm mut" style="line-height:1.8">اضغط مطوّلًا جوه الخانة ← تحديد الكل ← نسخ.</div>
       <textarea id="cpTxt" dir="ltr" rows="10" readonly style="font-size:12px;margin-top:8px">${esc(t)}</textarea>
-      <button class="btn" data-act="syncOpen">رجوع</button>`);
+      <button class="btn" data-act="${back}">رجوع</button>`);
     setTimeout(() => { const a = $('#cpTxt'); if (a) { a.focus(); a.select(); } }, 60);
   };
   if (legacy()) return done();
@@ -1834,6 +1856,262 @@ function syncPasteCode() {
   SYNC.form = { ...SYNC.form, dbUrl: j.u || '', apiKey: j.k || '', email: j.e || '', password: j.p || '' };
   syncSheet(); toast('اتملت البيانات — اضغط "ربط الجهاز"');
 }
+/* =====================================================================
+   استيراد العمليات من Excel / CSV  +  ملخص أرصدة الأصحاب
+   ===================================================================== */
+let IMX = null;
+const KX = {
+  date: ['تاريخ', 'date', 'وقت'],
+  fee: ['رسوم', 'عموله', 'fee', 'commission', 'مصاريف'],
+  in: ['داخل', 'وارد', 'ايداع', 'دائن', 'credit', 'deposit', 'received', 'in'],
+  out: ['خارج', 'صادر', 'سحب', 'مدين', 'debit', 'withdraw', 'paid', 'out'],
+  type: ['نوع', 'type', 'حركه', 'اتجاه'],
+  ref: ['مرجع', 'reference', 'ref', 'رقم العمليه', 'رقم المعامله', 'رقم الحركه', 'رقم التحويل', 'txn'],
+  party: ['الطرف', 'طرف', 'party', 'counterparty', 'جه منين', 'راح لفين'],
+  inst: ['البنك', 'بنك', 'الجهه', 'المحفظه', 'bank', 'wallet'],
+  owner: ['صاحب', 'الاسم', 'اسم', 'العميل', 'owner', 'holder', 'name', 'customer'],
+  amount: ['المبلغ', 'amount', 'قيمه', 'value', 'مبلغ'],
+  note: ['ملاحظات', 'ملاحظه', 'note', 'notes', 'بيان', 'وصف', 'description', 'details', 'تفاصيل'],
+};
+const XCATS = ['date', 'fee', 'in', 'out', 'type', 'ref', 'party', 'inst', 'owner', 'amount', 'note'];
+const XLABEL = { date: 'عمود التاريخ', owner: 'عمود صاحب الحساب', inst: 'عمود البنك / المحفظة', in: 'عمود الداخل', out: 'عمود الخارج', amount: 'عمود المبلغ', type: 'عمود النوع (داخل/خارج) — اختياري', party: 'عمود الطرف الآخر — اختياري', ref: 'عمود المرجع — اختياري', fee: 'عمود الرسوم — اختياري', note: 'عمود الملاحظات — اختياري' };
+
+function detectTxMap(rows) {
+  let hi = -1; const all = [].concat(...Object.values(KX));
+  for (let r = 0; r < Math.min(rows.length, 20); r++) {
+    const cells = rows[r].map((c) => norm(String(c ?? '')));
+    if (cells.filter((c) => c && all.some((k) => kwHit(c, k))).length >= 2) { hi = r; break; }
+  }
+  const hdr = hi >= 0 ? rows[hi].map((c) => String(c ?? '').trim()) : null;
+  const map = {}; XCATS.forEach((k) => (map[k] = -1));
+  if (hdr) hdr.forEach((h, ci) => {
+    const n = norm(h); if (!n) return;
+    const cat = XCATS.find((k) => map[k] < 0 && KX[k].some((w) => kwHit(n, w)));
+    if (cat) map[cat] = ci;
+  });
+  return { hi, hdr, map };
+}
+function imxSetSheet(i) {
+  const sh = IMX.sheets[i]; IMX.si = i; IMX.rows = sh.rows;
+  const d = detectTxMap(sh.rows);
+  IMX.hdr = d.hdr; IMX.map = d.map; IMX.dataStart = d.hi >= 0 ? d.hi + 1 : 0;
+  IMX.mode = d.map.amount >= 0 && !(d.map.in >= 0 || d.map.out >= 0) ? 'one' : 'two';
+  IMX.fixOwner = ''; IMX.fixInst = '';
+  // ملف اتصدّر من التطبيق: أول سطر فيه "اسم الشخص — اسم البنك"
+  const first = (sh.rows[0] || []).filter((c) => String(c).trim() !== '');
+  if (first.length === 1 && / [—-] /.test(String(first[0])) && d.map.owner < 0 && d.map.inst < 0) {
+    const parts = String(first[0]).split(/ [—-] /); IMX.fixOwner = parts[0].trim(); IMX.fixInst = (parts[1] || '').trim();
+  }
+}
+function txImpStart() {
+  IMX = null;
+  sheet(`<div class="sh-h"><b>استيراد عمليات من Excel</b><button class="x" data-act="closeSheet">✕</button></div>
+    <div class="sm mut" style="line-height:1.9">اختار ملف Excel (.xlsx) أو CSV فيه العمليات. التطبيق بيتعرّف على الأعمدة لوحده، وبعدين تراجعها وتأكد قبل ما يتسجّل أي حاجة.</div>
+    <div class="card" style="margin-top:8px"><div class="sm" style="line-height:1.9"><b>الأعمدة المعروفة:</b> التاريخ • صاحب الحساب • البنك/المحفظة • داخل • خارج (أو مبلغ واحد) • الطرف الآخر • المرجع • الرسوم • ملاحظات.<br>لو الملف مافيهوش صاحب الحساب أو البنك، هتختارهم مرة واحدة لكل الصفوف.</div></div>
+    <button class="btn ghost" data-act="imxTemplate">⬇ تنزيل نموذج Excel جاهز</button>
+    <label for="imxfile" class="btn" style="display:block;text-align:center;cursor:pointer">📂 اختيار الملف</label>
+    <input type="file" id="imxfile" hidden accept=".csv,.xlsx,.xlsm,.xls,.tsv,.txt,.html,.htm,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">`);
+}
+function imxTemplate() {
+  const H = (a) => a.map(HC);
+  download(xlsxBlob([{ name: 'عمليات', widths: [13, 22, 22, 14, 14, 20, 18, 10, 28],
+    rows: [H(['التاريخ', 'صاحب الحساب', 'البنك / المحفظة', 'داخل', 'خارج', 'الطرف الآخر', 'المرجع', 'الرسوم', 'ملاحظات']),
+      ['2026-09-21', 'محمد رجب', 'بنك مصر', 1500, '', 'أحمد علي', 'TRX100', 0, 'تحويل وارد'],
+      ['2026-09-22', 'محمد رجب', 'فودافون كاش', '', 300, '', '', 5, '']] }]), 'recon_import_template.xlsx');
+  toast('اتحفظ النموذج في التنزيلات');
+}
+async function imxLoad(f) {
+  try {
+    const sheets = (await readAnyTable(f)).filter((s) => s.rows.length >= 2);
+    if (!sheets.length) return toast('الملف فاضي أو مش مقروء');
+    IMX = { sheets, si: 0, skipDup: true, rec: false, inv: false, step: 'map' };
+    let pick = 0;   // أول ورقة فيها تاريخ ومبلغ
+    for (let i = 0; i < sheets.length; i++) { const d = detectTxMap(sheets[i].rows); if (d.map.date >= 0 && (d.map.in >= 0 || d.map.out >= 0 || d.map.amount >= 0)) { pick = i; break; } }
+    imxSetSheet(pick); imxMapStep();
+  } catch (e) {
+    toast(e.message === 'oldxls' ? 'ملف xls القديم مش مدعوم — افتحه واحفظه xlsx أو CSV' : e.message === 'nodecomp' ? 'المتصفح ده مش بيقرأ xlsx — احفظ الملف CSV' : 'تعذّر قراءة الملف');
+  }
+}
+const IN_WORDS = ['داخل', 'وارد', 'ايداع', 'دائن', 'credit', 'deposit', 'receive', 'استلام', 'قبض', 'in'];
+const OUT_WORDS = ['خارج', 'صادر', 'سحب', 'مدين', 'debit', 'withdraw', 'payment', 'دفع', 'out'];
+function typeDir(v) {
+  const n = norm(String(v ?? '')); if (!n) return null;
+  if (IN_WORDS.some((w) => kwHit(n, w))) return 'in';
+  if (OUT_WORDS.some((w) => kwHit(n, w))) return 'out';
+  return null;
+}
+function imxLines() {
+  const { rows, dataStart, map, mode, inv } = IMX, out = [], skipped = [];
+  for (let r = dataStart; r < rows.length; r++) {
+    const row = rows[r], g = (k) => (map[k] >= 0 ? row[map[k]] : undefined), rn = r + 1;
+    const date = parseDateAny(g('date'));
+    let amt = NaN, dir = null;
+    if (mode === 'two') { const i = numLoose(g('in')), o = numLoose(g('out')); if (i > 0) { amt = i; dir = 'in'; } else if (o > 0) { amt = o; dir = 'out'; } }
+    else {
+      const v = numLoose(g('amount'));
+      if (isFinite(v) && v !== 0) { amt = Math.abs(v); dir = (map.type >= 0 ? typeDir(g('type')) : null) || ((v < 0) !== !!inv ? 'out' : 'in'); }
+    }
+    if (!(amt > 0)) { if (date || (map.owner >= 0 && String(g('owner') ?? '').trim())) skipped.push({ rn, why: 'بدون مبلغ' }); continue; }
+    if (!date) { skipped.push({ rn, why: 'تاريخ ناقص أو مش مفهوم' }); continue; }
+    const owner = String((map.owner >= 0 ? g('owner') : IMX.fixOwner) ?? '').trim(), inst = String((map.inst >= 0 ? g('inst') : IMX.fixInst) ?? '').trim();
+    if (!owner) { skipped.push({ rn, why: 'بدون صاحب حساب' }); continue; }
+    if (!inst) { skipped.push({ rn, why: 'بدون بنك / محفظة' }); continue; }
+    const fee = numLoose(g('fee'));
+    out.push({ rn, date, dir, amount: r2(amt), fee: isFinite(fee) ? r2(Math.abs(fee)) : 0, owner, inst, party: String(g('party') ?? '').trim(), ref: String(g('ref') ?? '').trim(), note: String(g('note') ?? '').trim() });
+  }
+  return { out, skipped };
+}
+function imxMapStep() {
+  IMX.step = 'map';
+  const { sheets, si, rows, hdr, map, mode, inv } = IMX; const nc = Math.max(...rows.slice(0, 50).map((r) => r.length));
+  const opts = (cur) => '<option value="-1">— مفيش —</option>' + Array.from({ length: nc }, (_, i) => `<option value="${i}" ${cur === i ? 'selected' : ''}>${esc((hdr && hdr[i]) || 'عمود ' + (i + 1))}</option>`).join('');
+  const sel = (k) => `<label>${XLABEL[k]}</label><select data-imx="${k}">${opts(map[k])}</select>`;
+  const { out, skipped } = imxLines(), sample = out.slice(0, 3);
+  const fixed = (k, pickAct, val, what) => map[k] < 0 ? `<button class="pick" style="margin-top:8px" data-act="${pickAct}">${val ? '✓ ' + esc(val) + ' (لكل الصفوف)' : 'اختار ' + what + ' لكل الصفوف...'}</button>` : '';
+  sheet(`<div class="sh-h"><b>راجع الأعمدة</b><button class="x" data-act="closeSheet">✕</button></div>
+    ${sheets.length > 1 ? `<label>الورقة (Sheet)</label><select data-imx="si">${sheets.map((s, i) => `<option value="${i}" ${i === si ? 'selected' : ''}>${esc(s.name || 'ورقة ' + (i + 1))}</option>`).join('')}</select>` : ''}
+    <div class="sm mut" style="margin-top:6px">اتعرّفت على الأعمدة تلقائيًا — عدّلها لو في حاجة غلط.</div>
+    ${sel('date')}${sel('owner')}${fixed('owner', 'imxPickOwner', IMX.fixOwner, 'صاحب الحساب')}
+    ${sel('inst')}${fixed('inst', 'imxPickInst', IMX.fixInst, 'البنك أو المحفظة')}
+    <label>شكل المبلغ في الملف</label><select data-imx="mode"><option value="two" ${mode === 'two' ? 'selected' : ''}>عمودين (داخل / خارج)</option><option value="one" ${mode === 'one' ? 'selected' : ''}>عمود واحد للمبلغ</option></select>
+    ${mode === 'two' ? sel('in') + sel('out') : sel('amount') + sel('type') + `<label class="chk" style="margin-top:10px"><input type="checkbox" data-imx="inv" ${inv ? 'checked' : ''}> عكس الاتجاه (الموجب = خارج) لما مفيش عمود نوع</label>`}
+    ${sel('party')}${sel('ref')}${sel('fee')}${sel('note')}
+    <div class="card" style="margin-top:14px"><b>${out.length}</b> صف جاهز${skipped.length ? ` • <span class="warn">${skipped.length} هيتخطّى</span>` : ''}
+      ${sample.length ? '<div class="sm mut" style="margin-top:6px;line-height:1.8">' + sample.map((l) => `${shortDate(l.date)} • ${esc(l.owner)} • ${esc(l.inst)} • ${l.dir === 'in' ? '+' : '-'}${fmt(l.amount)}`).join('<br>') + '</div>' : ''}</div>
+    <button class="btn" data-act="imxPreview" ${out.length ? '' : 'disabled style="opacity:.5"'}>معاينة وتأكيد</button>`);
+}
+/* ---- مطابقة الأسماء مع اللي موجود ---- */
+const findOwnerByName = (n) => db.owners.find((o) => norm(o.name) === norm(n));
+const findPartyByName = (n) => db.parties.find((p) => norm(p.name) === norm(n));
+function findInstByName(name) {
+  const n = norm(name); if (!n) return null;
+  const ex = db.inst.find((i) => norm(i.ar) === n || (i.en && norm(i.en) === n));
+  if (ex) return { inst: ex, how: 'exact' };
+  const c = db.inst.filter((i) => { const a = norm(i.ar), e = norm(i.en || ''); return a.includes(n) || n.includes(a) || (e && (e.includes(n) || n.includes(e))); });
+  if (!c.length) return null;
+  const best = c.map((i) => [score(name, i.ar + ' ' + (i.en || '')), i]).sort((a, b) => b[0] - a[0] || a[1].ar.length - b[1].ar.length)[0][1];
+  return { inst: best, how: 'similar' };
+}
+function imxPlan() {
+  const { out, skipped } = imxLines();
+  const O = new Map(), I = new Map(), P = new Map();
+  const ownerOf = (n) => { const k = norm(n); if (!O.has(k)) { const ex = findOwnerByName(n); O.set(k, { name: n, id: ex ? ex.id : null }); } return O.get(k); };
+  const instOf = (n) => { const k = norm(n); if (!I.has(k)) { const m = findInstByName(n); I.set(k, { name: n, id: m ? m.inst.id : null, target: m ? m.inst.ar : '', how: m ? m.how : 'new' }); } return I.get(k); };
+  const partyOf = (n) => { if (!n) return null; const k = norm(n); if (!P.has(k)) { const ex = findPartyByName(n); P.set(k, { name: n, id: ex ? ex.id : null }); } return P.get(k); };
+  const dupMap = new Map();   // نفس الشخص والجهة والنوع والمبلغ والتاريخ (والمرجع لو الاتنين عندهم مرجع)
+  db.tx.forEach((t) => { const k = [t.owner, t.inst, t.dir, t.amount, t.date].join('|'); if (!dupMap.has(k)) dupMap.set(k, []); dupMap.get(k).push(normRef(t.ref)); });
+  const isDup = (o, i, l) => { const refs = dupMap.get([o, i, l.dir, l.amount, l.date].join('|')); if (!refs) return false; const r = normRef(l.ref); return refs.some((x) => !r || !x || x === r); };
+  const rows = out.map((l) => {
+    const o = ownerOf(l.owner), i = instOf(l.inst), p = partyOf(l.party);
+    const dup = !!(o.id && i.id && isDup(o.id, i.id, l));
+    return { ...l, o, i, p, dup };
+  });
+  return { rows, skipped, owners: [...O.values()], insts: [...I.values()], parties: [...P.values()] };
+}
+function imxPreview() {
+  IMX.step = 'prev';
+  const pl = imxPlan(), dups = pl.rows.filter((r) => r.dup).length, ready = pl.rows.length - (IMX.skipDup ? dups : 0);
+  const newO = pl.owners.filter((o) => !o.id), newI = pl.insts.filter((i) => i.how === 'new'), simI = pl.insts.filter((i) => i.how === 'similar'), newP = pl.parties.filter((p) => !p.id);
+  sheet(`<div class="sh-h"><b>معاينة الاستيراد</b><button class="x" data-act="closeSheet">✕</button></div>
+    <div class="card" style="margin-top:8px"><div class="kv"><b>✅ عمليات جاهزة</b><span class="in">${ready}</span></div>
+      <div class="kv"><b>♻ مكررة (موجودة قبل كده)</b><span class="warn">${dups}</span></div>
+      <div class="kv"><b>⏭ صفوف هتتخطّى</b><span class="out">${pl.skipped.length}</span></div></div>
+    ${newO.length ? `<h3>👤 أصحاب حسابات جدد (${newO.length})</h3><div class="chips" style="flex-wrap:wrap">${newO.slice(0, 30).map((o) => `<span class="chip">${esc(o.name)}</span>`).join('')}</div>` : ''}
+    ${pl.insts.length ? `<h3>🏦 البنوك والمحافظ</h3>${pl.insts.map((i) => `<div class="chk-tile"><div class="grow">${esc(i.name)}${i.how === 'exact' ? '' : ` ← <b>${i.how === 'similar' ? esc(i.target) : 'بنك جديد'}</b>`}</div><span class="sm ${i.how === 'new' ? 'warn' : i.how === 'similar' ? 'warn' : 'in'}">${i.how === 'exact' ? 'موجود ✓' : i.how === 'similar' ? 'متشابه ≈' : 'جديد ➕'}</span></div>`).join('')}` : ''}
+    ${newP.length ? `<div class="sm mut" style="margin-top:8px">🔁 ${newP.length} طرف آخر جديد هيتضاف.</div>` : ''}
+    ${pl.skipped.length ? `<h3>⏭ صفوف هتتخطّى</h3>${pl.skipped.slice(0, 6).map((s) => `<div class="sm mut">صف ${s.rn}: ${esc(s.why)}</div>`).join('')}${pl.skipped.length > 6 ? `<div class="sm mut">و ${pl.skipped.length - 6} تانيين...</div>` : ''}` : ''}
+    <label class="chk" style="margin-top:14px"><input type="checkbox" data-imx="skipDup" ${IMX.skipDup ? 'checked' : ''}> تخطّي العمليات المكررة</label>
+    <label class="chk" style="margin-top:8px"><input type="checkbox" data-imx="rec" ${IMX.rec ? 'checked' : ''}> تأشير العمليات كمطابقة</label>
+    <button class="btn" data-act="imxApply" ${ready ? '' : 'disabled style="opacity:.5"'}>استيراد ${ready} عملية</button>
+    <button class="btn ghost" data-act="imxBackMap">رجوع للأعمدة</button>`);
+}
+function imxApply() {
+  const pl = imxPlan(), rows = pl.rows.filter((r) => !(IMX.skipDup && r.dup));
+  if (!rows.length) return toast('مفيش عمليات للاستيراد');
+  const L = { ids: [], owners: [], parties: [], insts: [], at: Date.now() };
+  const oId = new Map(), iId = new Map(), pId = new Map();
+  pl.owners.forEach((o) => { if (o.id) oId.set(norm(o.name), o.id); else { const n = addOwner(o.name); oId.set(norm(o.name), n.id); L.owners.push(n.id); } });
+  pl.insts.forEach((i) => { if (i.id) iId.set(norm(i.name), i.id); else { const n = addBank(i.name); iId.set(norm(i.name), n.id); L.insts.push(n.id); } });
+  pl.parties.forEach((p) => { if (p.id) pId.set(norm(p.name), p.id); else { const n = addParty(p.name); pId.set(norm(p.name), n.id); L.parties.push(n.id); } });
+  rows.forEach((r) => {
+    const id = nid();
+    db.tx.push({ id, date: r.date, dir: r.dir, inst: iId.get(norm(r.inst)), owner: oId.get(norm(r.owner)), party: r.party ? pId.get(norm(r.party)) || 0 : 0, amount: r.amount, fee: r.fee, ref: r.ref, note: r.note.slice(0, 200), rec: !!IMX.rec, att: false, created: Date.now() });
+    L.ids.push(id);
+  });
+  db.lastImport = L; save(); closeSheet(); render();
+  toast('اتضاف ' + rows.length + ' عملية', 'تراجع', imxUndo);
+}
+function imxUndo() {
+  const L = db.lastImport; if (!L) return toast('مفيش استيراد للتراجع عنه');
+  const ids = new Set(L.ids); const before = db.tx.length;
+  db.tx = db.tx.filter((t) => !ids.has(t.id));
+  const used = (f, id) => db.tx.some((t) => t[f] === id) || db.trash.some((t) => t[f] === id);
+  db.owners = db.owners.filter((o) => !L.owners.includes(o.id) || used('owner', o.id) || db.accounts.some((a) => a.owner === o.id));
+  db.parties = db.parties.filter((p) => !L.parties.includes(p.id) || used('party', p.id));
+  db.inst = db.inst.filter((i) => !L.insts.includes(i.id) || used('inst', i.id) || db.accounts.some((a) => a.inst === i.id));
+  const n = before - db.tx.length; delete db.lastImport; save(); render(); toast('اتلغى الاستيراد (' + n + ' عملية)');
+}
+
+/* =====================================================================
+   ملخص أرصدة الأصحاب (مع اختيار البنك)
+   ===================================================================== */
+let BF = { inst: '', to: '', hideZero: true, sort: 'name' };
+function balData() {
+  const m = new Map();
+  allAccounts().forEach((a) => { if (BF.inst && a.inst !== Number(BF.inst)) return; m.set(accKey(a.owner, a.inst), { owner: a.owner, inst: a.inst, bal: a.opening || 0 }); });
+  db.tx.forEach((t) => { if (BF.to && t.date > BF.to) return; const s = m.get(accKey(t.owner, t.inst)); if (s) s.bal += signed(t); });
+  const by = new Map();
+  m.forEach((s) => {
+    if (BF.hideZero && Math.abs(s.bal) < 0.005) return;
+    if (!by.has(s.owner)) by.set(s.owner, { owner: s.owner, accs: [], total: 0 });
+    const o = by.get(s.owner); o.accs.push(s); o.total += s.bal;
+  });
+  const list = [...by.values()];
+  list.forEach((o) => o.accs.sort((a, b) => instById(a.inst).ar.localeCompare(instById(b.inst).ar, 'ar')));
+  list.sort(BF.sort === 'bal' ? (a, b) => b.total - a.total : (a, b) => ownerById(a.owner).name.localeCompare(ownerById(b.owner).name, 'ar'));
+  return { list, total: list.reduce((s, o) => s + o.total, 0) };
+}
+function balancesView() {
+  const d = balData(), insts = [...new Set(allAccounts().map((a) => a.inst))].map(instById).sort((a, b) => a.ar.localeCompare(b.ar, 'ar'));
+  const opt = (arr, cur) => arr.map(([v, l]) => `<option value="${v}" ${String(cur) === String(v) ? 'selected' : ''}>${esc(l)}</option>`).join('');
+  const bank = BF.inst ? instById(Number(BF.inst)) : null;
+  return `<div class="two"><div><label style="margin-top:0">البنك / المحفظة</label><select data-bf="inst">${opt([['', 'كل البنوك والمحافظ'], ...insts.map((i) => [i.id, i.ar])], BF.inst)}</select></div>
+      <div><label style="margin-top:0">لحد تاريخ (اختياري)</label><input type="date" data-bf="to" value="${BF.to}"></div></div>
+    <div class="two" style="margin-top:8px"><select data-bf="sort">${opt([['name', 'ترتيب بالاسم'], ['bal', 'الأعلى رصيدًا أولًا']], BF.sort)}</select>
+      <label class="chk" style="margin:0"><input type="checkbox" data-bf="hideZero" ${BF.hideZero ? 'checked' : ''}> إخفاء الأرصدة الصفر</label></div>
+    <div class="card" style="margin-top:10px"><div class="mut sm">${bank ? 'إجمالي الأرصدة في ' + esc(bank.ar) : 'إجمالي أرصدة كل الأصحاب'}${BF.to ? ' لحد ' + fmtDate(BF.to) : ''}</div>
+      <div class="big ${d.total >= 0 ? 'in' : 'out'}">${fmt(d.total)} ج.م</div><div class="sm mut">${d.list.length} صاحب حساب</div></div>
+    <div class="three" style="margin-bottom:10px"><button class="btn ghost" data-act="balExport">📊 Excel</button><button class="btn ghost" data-act="balShare">📤 مشاركة نص</button><button class="btn ghost" data-act="balCopy">📋 نسخ</button></div>
+    ${d.list.length ? (bank
+      ? `<div>${d.list.map((o) => `<div class="tile" data-act="stAcc" data-o="${o.owner}" data-i="${bank.id}"><div class="ava n">👤</div><div class="grow">${esc(ownerById(o.owner).name)}</div><b class="${o.total >= 0 ? 'in' : 'out'}">${fmt(o.total)}</b></div>`).join('')}</div>`
+      : d.list.map((o) => `<div class="card ocard"><div class="ohd" data-act="stOwner" data-id="${o.owner}"><div class="ava n">👤</div><div class="grow"><b>${esc(ownerById(o.owner).name)}</b><div class="sm mut">${o.accs.length} حساب</div></div><b class="${o.total >= 0 ? 'in' : 'out'}">${fmt(o.total)}</b></div>
+        ${o.accs.map((a) => { const i = instById(a.inst); return `<div class="arow" data-act="stAcc" data-o="${a.owner}" data-i="${a.inst}"><span>${instIcon(i)}</span><div class="grow">${esc(i.ar)}</div><b class="${a.bal >= 0 ? 'in' : 'out'}">${fmt(a.bal)}</b></div>`; }).join('')}</div>`).join(''))
+      : '<div class="card mut" style="text-align:center">مفيش أرصدة مطابقة</div>'}`;
+}
+function balText() {
+  const d = balData(), bank = BF.inst ? instById(Number(BF.inst)) : null;
+  const L = ['ملخص الأرصدة' + (bank ? ' — ' + bank.ar : '') + ' (' + fmtDate(BF.to || today()) + ')', ''];
+  d.list.forEach((o) => {
+    L.push(ownerById(o.owner).name + ': ' + fmt(o.total));
+    if (!bank && o.accs.length > 1) o.accs.forEach((a) => L.push('   • ' + instById(a.inst).ar + ': ' + fmt(a.bal)));
+  });
+  L.push('', 'الإجمالي: ' + fmt(d.total) + ' ج.م');
+  return L.join('\n');
+}
+async function balShare() {
+  const t = balText();
+  if (navigator.share) { try { await navigator.share({ text: t }); return; } catch (e) { if (e && e.name === 'AbortError') return; } }
+  copyText(t);
+}
+function balExport() {
+  const d = balData(); if (!d.list.length) return toast('مفيش أرصدة للتصدير');
+  const insts = [...new Set(d.list.flatMap((o) => o.accs.map((a) => a.inst)))].map(instById).sort((a, b) => a.ar.localeCompare(b.ar, 'ar'));
+  const colTot = insts.map((i) => r2(d.list.reduce((s, o) => s + ((o.accs.find((a) => a.inst === i.id) || {}).bal || 0), 0)));
+  const rows = [[HC('صاحب الحساب'), ...insts.map((i) => HC(i.ar)), HC('الإجمالي')],
+    ...d.list.map((o) => [ownerById(o.owner).name, ...insts.map((i) => { const a = o.accs.find((x) => x.inst === i.id); return a ? r2(a.bal) : ''; }), BN(r2(o.total))]),
+    [BT('الإجمالي'), ...colTot.map(BN), BN(r2(d.total))]];
+  download(xlsxBlob([{ name: 'ملخص الأرصدة', widths: [24, ...insts.map(() => 16), 16], rows }]), 'balances_' + today() + '.xlsx');
+}
 /* ================= الأحداث ================= */
 let backTo = 'reports';
 function openStatement(title, inst, owner) {
@@ -1860,12 +2138,25 @@ document.addEventListener('click', (e) => {
     case 'ofClear': OF[el.dataset.k] = el.dataset.k === 'pend' ? false : ''; render(); break;
     /* مزامنة الأجهزة */
     case 'syncOpen': syncSheet(); break;
+    /* استيراد من Excel + ملخص الأرصدة */
+    case 'txImp': txImpStart(); break;
+    case 'imxTemplate': imxTemplate(); break;
+    case 'imxPickOwner': pickOwner((oid) => { IMX.fixOwner = ownerById(oid).name; imxMapStep(); }); break;
+    case 'imxPickInst': pickInst((iid) => { IMX.fixInst = instById(iid).ar; imxMapStep(); }); break;
+    case 'imxPreview': imxPreview(); break;
+    case 'imxBackMap': imxMapStep(); break;
+    case 'imxApply': imxApply(); break;
+    case 'imxUndoAsk': askConfirm('هتتمسح ' + (db.lastImport ? db.lastImport.ids.length : 0) + ' عملية اتضافت في آخر استيراد (وكمان الأصحاب والبنوك الجديدة لو مش مستخدمة). متأكد؟', 'تراجع', imxUndo, true); break;
+    case 'balOpen': view = 'owners'; OT = 'bal'; selMode = false; render(); window.scrollTo(0, 0); break;
+    case 'balExport': balExport(); break;
+    case 'balShare': balShare(); break;
+    case 'balCopy': copyText(balText()); break;
     case 'syncNow': toast('جاري المزامنة...'); syncCycle().then(() => toast(SYNC.err ? 'مشكلة: ' + SYNC.err : 'اتزامنت ✓')); break;
     case 'syncConnect': syncConnect(); break;
     case 'syncOff': askConfirm('هيتقطع الربط على الجهاز ده بس. بياناتك على الجهاز والسحابة هتفضل زي ما هي.', 'اقطع الربط', syncDisconnect, true); break;
-    case 'syncCopyRules': copyText(rulesText(SYNC.form.email)); break;
-    case 'syncCopyStrong': copyText(strongRules(SYNC.cfg.uid)); break;
-    case 'syncCopyCode': copyText(setupCode()); break;
+    case 'syncCopyRules': copyText(rulesText(SYNC.form.email), 'syncOpen'); break;
+    case 'syncCopyStrong': copyText(strongRules(SYNC.cfg.uid), 'syncOpen'); break;
+    case 'syncCopyCode': copyText(setupCode(), 'syncOpen'); break;
     case 'syncPasteCode': syncPasteCode(); break;
     /* تنقل */
     case 'go': if (v === 'monthly') backTo = 'reports'; view = v; selMode = false; SEL.clear(); closeSheet(); render(); window.scrollTo(0, 0); break;
@@ -1986,6 +2277,7 @@ document.addEventListener('input', (e) => {
   const t = e.target;
   if (t.dataset.f) F[t.dataset.f] = t.value;
   else if (t.dataset.fl) FL[t.dataset.fl] = t.value;
+  else if (t.dataset.bf) { BF[t.dataset.bf] = t.type === 'checkbox' ? t.checked : t.value; render(); }
   else if (t.dataset.sc) { if (t.dataset.sc !== 'code') { SYNC.form[t.dataset.sc] = t.value; if (t.dataset.sc === 'email' && $('#rulesTxt')) $('#rulesTxt').value = rulesText(t.value); } }
   else if (t.dataset.hf) { HF[t.dataset.hf] = t.type === 'checkbox' ? t.checked : t.value; }
   else if (t.dataset.of) { OF[t.dataset.of] = t.type === 'checkbox' ? t.checked : t.value; }
@@ -2001,6 +2293,13 @@ document.addEventListener('change', async (e) => {
   const t = e.target;
   if (t.id === 'attInput' && t.files[0]) {
     try { F.attBlob = await compressImg(t.files[0]); F.attRemove = false; openTxForm(false); } catch (er) { toast('تعذّر قراءة الصورة'); }
+  } else if (t.id === 'imxfile' && t.files[0]) {
+    imxLoad(t.files[0]);
+  } else if (t.dataset.imx) {
+    const k = t.dataset.imx;
+    if (k === 'si') imxSetSheet(Number(t.value)); else if (k === 'mode') IMX.mode = t.value; else if (k === 'inv') IMX.inv = t.checked;
+    else if (k === 'skipDup') IMX.skipDup = t.checked; else if (k === 'rec') IMX.rec = t.checked; else IMX.map[k] = Number(t.value);
+    const y = $('.sh') ? $('.sh').scrollTop : 0; if (IMX.step === 'prev') imxPreview(); else imxMapStep(); if ($('.sh')) $('.sh').scrollTop = y;
   } else if (t.id === 'impfile' && t.files[0]) {
     impLoadFile(t.files[0]);
   } else if (t.dataset.imp) {
